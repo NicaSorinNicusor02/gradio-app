@@ -1,203 +1,337 @@
-import os
-import webbrowser
+#!/usr/bin/env python3
+import os, json, shutil, time, uuid, webbrowser
+from typing import List, Dict, Optional, Tuple
+
 import gradio as gr
-import pandas as pd
-from PIL import Image
+import numpy as np
+import cv2 as cv
 
-# --- căi implicite (schimbă după nevoie) ---
-DATA_DIR = os.path.join("data")
-INPUT_DIR = os.path.join(DATA_DIR, "input_images")
-OUT_DIR   = os.path.join(DATA_DIR, "outputs")
-os.makedirs(INPUT_DIR, exist_ok=True)
-os.makedirs(OUT_DIR, exist_ok=True)
+# --- wire in your local core modules ---
+import sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+CORE = os.path.join(HERE, "core")
+if CORE not in sys.path:
+    sys.path.insert(0, CORE)
 
-# --- import wrappers ---
-from scripts_app.metadata_catalog import run_catalog
-from scripts_app.yolo_geolocatie import run_yolo_to_csv
-from scripts_app.stitch import build_panorama
-from scripts_app.viz_defecte import draw_pins
-
-# =========================
-# TAB 1 — Catalog EXIF
-# =========================
-def ui_run_catalog(image_dir, out_csv, strict_ext):
-    df = run_catalog(image_dir, out_csv, strict_extension=strict_ext)
-    return out_csv, df
-
-# =========================
-# TAB 2 — YOLO→GPS→CSV
-# =========================
-def ui_run_yolo(
-    image_dir, model_path, metadata_csv, out_csv,
-    conf_thres, iou_thres, ref_lat, ref_lon,
-    origin_image_name, agl_override_m, focal_override_mm,
-    match_by_stem, ignore_exif
-):
-    df = run_yolo_to_csv(
-        image_dir=image_dir,
-        model_path=model_path,
-        metadata_csv=metadata_csv,
-        output_csv=out_csv,
-        conf_thres=conf_thres,
-        iou_thres=iou_thres,
-        ref_bl_lat=ref_lat,
-        ref_bl_lon=ref_lon,
-        origin_image_name=(origin_image_name or None),
-        agl_override_m=(agl_override_m if agl_override_m is not None else None),
-        focal_override_mm=(focal_override_mm if focal_override_mm is not None else None),
-        match_by_stem=bool(match_by_stem),
-        ignore_exif=bool(ignore_exif),
-    )
-    return out_csv, df
+# Step 1
+from core.stitcher import Stitcher
+from core.mapper import GeoMapper
+# Step 2
+from core.detector import YOLODetector
+from core.simulator import DetectionSimulator
+from core.box_projector import PanoBoxProjector
+# Step 3
+from core.geolocalizer import PanoGeoLocalizer
 
 
-# =========================
-# TAB 3 — Panoramă
-# =========================
-def ui_build_pano(image_dir, sp_w, sg_w, proj_root, pano_out, target_h, target_w):
-    path = build_panorama(
-        image_dir=image_dir,
-        superpoint_weights=sp_w,
-        superglue_weights=sg_w,
-        project_root=proj_root,
-        output_path=pano_out,
-        target_h=int(target_h), target_w=int(target_w),
-    )
-    return path
+# ========= app storage =========
+RUNS_DIR = os.path.join(HERE, "app_runs")
+os.makedirs(RUNS_DIR, exist_ok=True)
 
-# =========================
-# TAB 4 — Vizualizare
-# =========================
-def ui_draw_pins(pano_path, csv_path):
-    img, df, has_pano = draw_pins(pano_path, csv_path)
-    return img, df, ("Da" if has_pano else "Nu")
+def _new_run_dir() -> str:
+    d = os.path.join(RUNS_DIR, time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6])
+    os.makedirs(d, exist_ok=True)
+    os.makedirs(os.path.join(d, "images"), exist_ok=True)
+    os.makedirs(os.path.join(d, "det_vis"), exist_ok=True)
+    return d
 
-def ui_click_on_image(evt: gr.SelectData, df_csv):
-    if df_csv is None or len(df_csv)==0:
-        return "Nu am rânduri în CSV."
-    # dacă există coordonate pe panoramă, alegi pinul cel mai apropiat; altfel doar raportezi click
-    if "pano_x_px" in df_csv.columns and "pano_y_px" in df_csv.columns:
-        cx, cy = evt.index
-        pins = df_csv.dropna(subset=["pano_x_px","pano_y_px"]).copy()
-        if pins.empty:
-            return "Nu există pini în CSV."
-        d2 = (pins["pano_x_px"] - cx)**2 + (pins["pano_y_px"] - cy)**2
-        idx = int(d2.idxmin())
-        row = df_csv.loc[idx]
+def _overlay_path(out_png: str) -> str:
+    return os.path.splitext(out_png)[0] + ".overlay.png"
+
+def _boxes_path(out_png: str) -> str:
+    return os.path.splitext(out_png)[0] + ".boxes.json"
+
+def _world_path(out_png: str) -> str:
+    return os.path.splitext(out_png)[0] + ".world.json"
+
+def _index_path(out_png: str) -> str:
+    return os.path.splitext(out_png)[0] + ".index.json"
+
+
+# ========= STEP 1 (Data loading + Stitch) =========
+def ui_data_load(files: List[gr.File]) -> Tuple[str, str, str, dict]:
+    """
+    Copy uploads to a run folder and run Step 1 (stitch + world + index).
+    Returns: (run_dir, pano, status, summary_dict)
+    """
+    if not files:
+        return "", "", "⚠️ Please upload images first.", {}
+    run = _new_run_dir()
+    imgs_dir = os.path.join(run, "images")
+    for f in files:
+        # Gradio gives a tempfile path; we keep original names if possible
+        name = os.path.basename(getattr(f, "name", "img.jpg"))
+        # keep only image files
+        if not name.lower().endswith((".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")):
+            continue
+        shutil.copy(f.name, os.path.join(imgs_dir, name))
+
+    pano_path = os.path.join(run, "pano.png")
+    try:
+        # Step 1
+        stitcher = Stitcher(
+            imgs_dir=imgs_dir,
+            max_kpts=2000,
+            yaw_align=True,
+            exposure=False,
+            no_seams=False,
+            num_bands=3,
+            orb_fallback=False
+        )
+        pano, meta, exifs = stitcher.run()
+
+        gmap = GeoMapper(align='yaw')
+        phi_deg, A_world, epsg = gmap.choose_rotation(meta, exifs)
+        pano_oriented, A_adj, epsg_out, world_json_path, M_pano, _ = gmap.orient_and_world(
+            pano, phi_deg, A_world, epsg, pano_path
+        )
+        ok = cv.imwrite(pano_path, pano_oriented)
+        if not ok:
+            raise RuntimeError("Failed to save panorama.")
+
+        # save index
+        from pathlib import Path
+        Hs = [np.array(H, np.float64) for H in meta["Hs_shift"]]
+        if M_pano is None:
+            M_pano = np.eye(3, dtype=np.float64)
+        Hs_out = [(np.array(M_pano, np.float64) @ H).tolist() for H in Hs]
+        idx = {
+            "mosaic_size": [int(pano_oriented.shape[1]), int(pano_oriented.shape[0])],
+            "H_proc_to_pano": Hs_out,
+            "frames": meta.get("frame_models", [])
+        }
+        with open(_index_path(pano_path), "w") as f:
+            json.dump(idx, f, indent=2)
+
+        # small summary
+        gps_ok = os.path.exists(_world_path(pano_path))
+        summary = {
+            "run_dir": run,
+            "images": len(meta.get("frame_models", [])),
+            "pano": pano_path,
+            "world_json": gps_ok,
+            "index_json": True
+        }
+        return run, pano_path, "✅ Stitch complete.", summary
+
+    except Exception as e:
+        return run, "", f"❌ Stitch failed: {e}", {}
+
+
+# ========= STEP 2 (Detect or Simulate + Project) =========
+def ui_step2_detect(run_dir: str, mode: str, weights: str, data_yaml: str,
+                    classes: str, imgsz: int, conf: float, iou: float, max_det: int) -> Tuple[str, str, dict]:
+    """
+    Run detector OR open simulator, then project detections to pano.
+    Returns: (overlay_png, boxes_json_path, stats_dict)
+    """
+    if not run_dir or not os.path.isdir(run_dir):
+        return "", "", {"error": "Invalid run. Load data first."}
+
+    pano = os.path.join(run_dir, "pano.png")
+    idx_path = _index_path(pano)
+    if not (os.path.exists(pano) and os.path.exists(idx_path)):
+        return "", "", {"error": "Missing pano or index. Run Step 1 first."}
+
+    idx = json.load(open(idx_path, "r"))
+    det_vis_dir = os.path.join(run_dir, "det_vis")
+
+    # 2a) detections
+    if mode == "detect":
+        if not weights:
+            return "", "", {"error": "Please provide YOLO weights (.pt/.pth)."}
+        det = YOLODetector(weights=weights, imgsz=imgsz, conf=conf, iou=iou,
+                           max_det=max_det, classes=classes, data_yaml=data_yaml)
+        dets = det.run_on_index(idx, limit=None, save_vis_dir=det_vis_dir)
     else:
-        # fără coordonate, alegi primul (sau nimic)
-        row = df_csv.iloc[0]
+        # manual simulator in a notebook/server isn’t ideal; instead, accept empty list here
+        dets = []  # user can pre-create detections.json and drop into run_dir if needed
 
-    lat = float(row.get("defect_lat"))
-    lon = float(row.get("defect_lon"))
-    cls = row.get("defect_class","?")
-    conf = row.get("confidence","?")
-    url = f"https://www.google.com/maps?q={lat:.7f},{lon:.7f}"
-    try: webbrowser.open_new_tab(url)
-    except: pass
-    return f"#{int(getattr(row,'name',0))} | {cls} ({conf:.2f}) → [Deschide în Google Maps]({url})"
+    # 2b) project to pano
+    pj = PanoBoxProjector(idx, pano_bgr=cv.imread(pano, cv.IMREAD_COLOR))
+    boxes_on_pano = pj.project(dets)
+    pj.write_overlay(_overlay_path(pano))
+    with open(_boxes_path(pano), "w") as f:
+        json.dump(boxes_on_pano, f, indent=2)
 
-# =========================
-# UI Gradio
-# =========================
-with gr.Blocks(title="Drone CV Suite", theme=gr.themes.Base()) as demo:
-    gr.Markdown("# 🚁 Drone CV Suite — Catalog EXIF · YOLO→GPS · Panoramă · Vizualizare")
+    stats = {
+        "detections": len(dets),
+        "projected": len(boxes_on_pano),
+        "overlay": _overlay_path(pano),
+        "boxes_json": _boxes_path(pano),
+        "det_vis_dir": det_vis_dir
+    }
+    return _overlay_path(pano), _boxes_path(pano), stats
 
-    state_df = gr.State(None)    # pentru tabelul încărcat în Tab 4
+
+# ========= STEP 3 (Geolocalize clicks / boxes) =========
+def _maps_url(lat: float, lon: float, zoom: int = 20) -> str:
+    return f"https://www.google.com/maps/search/?api=1&query={lat:.7f}%2C{lon:.7f}&zoom={zoom}"
+
+def ui_map_load(run_dir: str) -> Tuple[str, List[Dict], str]:
+    """Return pano overlay + boxes list + info text."""
+    if not run_dir:
+        return "", [], "⚠️ Load data first."
+    pano = os.path.join(run_dir, "pano.png")
+    boxes_path = _boxes_path(pano)
+    overlay = _overlay_path(pano) if os.path.exists(_overlay_path(pano)) else pano
+    boxes = json.load(open(boxes_path, "r")) if os.path.exists(boxes_path) else []
+    return overlay, boxes, f"Loaded {len(boxes)} projected boxes."
+
+def ui_map_click(evt: gr.SelectData, run_dir: str, open_maps: bool, zoom: int) -> str:
+    """Click anywhere on pano → lat/lon using PanoGeoLocalizer."""
+    if not run_dir:
+        return "⚠️ Load data first."
+    pano = os.path.join(run_dir, "pano.png")
+    try:
+        gl = PanoGeoLocalizer(pano, world_json=_world_path(pano),
+                              gcps_json=None, boxes_json=_boxes_path(pano),
+                              open_on_click=False, zoom=zoom)
+    except Exception as e:
+        return f"❌ {e}"
+
+    u, v = map(float, evt.index)  # (x,y) from displayed image
+    lat, lon, E, N = gl.uv_to_latlon(u, v)
+    url = _maps_url(lat, lon, zoom)
+    if open_maps:
+        try: webbrowser.open_new_tab(url)
+        except: pass
+    return f"**lat, lon** = `{lat:.7f}, {lon:.7f}`  ·  **E,N** = `{E:.2f}, {N:.2f}`  ·  [Open in Google Maps]({url})"
+
+def ui_first_detection_open(run_dir: str, open_maps: bool, zoom: int) -> str:
+    """Open Google Maps at the first box center (quick sanity button)."""
+    if not run_dir:
+        return "⚠️ Load data first."
+    pano = os.path.join(run_dir, "pano.png")
+    boxes_path = _boxes_path(pano)
+    if not os.path.exists(boxes_path):
+        return "⚠️ No boxes (run Step 2)."
+    boxes = json.load(open(boxes_path, "r"))
+    if not boxes:
+        return "⚠️ No boxes to open."
+    b = boxes[0]
+    q = np.asarray(b["quad"], np.float64)
+    cx, cy = float(q[:,0].mean()), float(q[:,1].mean())
+
+    gl = PanoGeoLocalizer(pano, world_json=_world_path(pano),
+                          gcps_json=None, boxes_json=boxes_path,
+                          open_on_click=False, zoom=zoom)
+    lat, lon, E, N = gl.uv_to_latlon(cx, cy)
+    url = _maps_url(lat, lon, zoom)
+    if open_maps:
+        try: webbrowser.open_new_tab(url)
+        except: pass
+    return f"Box #{b.get('id','0')} → **lat, lon** = `{lat:.7f}, {lon:.7f}`  ·  [Open in Google Maps]({url})"
+
+
+# ========= Gradio UI =========
+with gr.Blocks(title="Enevo Demo App", theme=gr.themes.Soft(primary_hue="blue")) as demo:
+    gr.Markdown("# 🌞 Enevo Demo App\n*Stitch → Detect/Simulate → Project → Geolocalize*")
+
+    # shared state across tabs
+    run_state = gr.State("")     # run_dir path
+    summary_state = gr.State({}) # dict summary from step1
+    step2stats_state = gr.State({})
 
     with gr.Tabs():
-        # ---------- TAB 1 ----------
-        with gr.Tab("1) Catalog EXIF → CSV"):
+
+        # -------------------- Data Loading --------------------
+        with gr.Tab("Data Loading"):
+            gr.Markdown("Upload your **drone images** and press **Process & Stitch**. "
+                        "All data is validated and processed before moving on.")
+            uploads = gr.File(file_count="multiple", file_types=["image"], label="Upload images")
+            btn_stitch = gr.Button("Process & Stitch", variant="primary")
+            out_pano = gr.Image(label="Panorama preview", interactive=False)
+            status = gr.Markdown()
+            summary_json = gr.JSON(label="Summary")
+
+            def _run_stitch(files):
+                run, pano, msg, summary = ui_data_load(files)
+                return run, summary, gr.update(value=pano, visible=bool(pano)), msg
+
+            btn_stitch.click(_run_stitch, inputs=[uploads],
+                             outputs=[run_state, summary_state, out_pano, status])
+
+        # -------------------- Dashboard #1 --------------------
+        with gr.Tab("Dashboard #1"):
+            gr.Markdown("### Summary\nOptions for detailed info. You can download results or proceed.")
+            show_summary = gr.Button("Refresh Summary")
+            sum_out = gr.JSON(label="Summary")
+            dl_world = gr.File(label="pano.world.json")
+            dl_index = gr.File(label="pano.index.json")
+
+            def _refresh_summary(run):
+                if not run:
+                    return {}, None, None
+                pano = os.path.join(run, "pano.png")
+                wp, ip = _world_path(pano), _index_path(pano)
+                wfile = wp if os.path.exists(wp) else None
+                ifile = ip if os.path.exists(ip) else None
+                return json.load(open(_index_path(pano))) if os.path.exists(ip) else {}, wfile, ifile
+
+            show_summary.click(_refresh_summary, inputs=[run_state], outputs=[sum_out, dl_world, dl_index])
+
+            gr.Markdown("**Next:** use tabs to open **Dashboard #2 (Map)** or **Dashboard #3 (Faults)**.")
+
+        # -------------------- Dashboard #2 (Map) --------------------
+        with gr.Tab("Dashboard #2"):
+            gr.Markdown("### Map (Geolocation) + Overview (Stitching)")
+            row = gr.Row()
+            with row:
+                pano_map = gr.Image(type="filepath", label="Panorama (with overlay if available)", interactive=True)
+                boxes_view = gr.JSON(label="Projected boxes (pano.quads)")
+            info_click = gr.Markdown()
             with gr.Row():
-                t_image_dir = gr.Textbox(value=INPUT_DIR, label="Director imagini")
-                t_out_csv   = gr.Textbox(value=os.path.join(OUT_DIR, "catalog_metadate.csv"), label="CSV ieșire")
-            strict_ext = gr.Checkbox(value=True, label="Doar .jpg lowercase (STRICT_EXTENSION)")
-            btn_cat = gr.Button("Generează catalog")
-            cat_file = gr.File(label="CSV generat")
-            cat_table = gr.Dataframe(label="Previzualizare CSV", wrap=True)
+                btn_load_map = gr.Button("Load Map/Overlay", variant="primary")
+                cb_open_maps = gr.Checkbox(value=False, label="Open Google Maps on click")
+                zoom_slider = gr.Slider(10, 22, value=20, step=1, label="Maps zoom")
+                btn_open_first = gr.Button("Open first detection in Maps")
 
-            btn_cat.click(ui_run_catalog, [t_image_dir, t_out_csv, strict_ext], [cat_file, cat_table])
+            def _load_map(run):
+                overlay, boxes, msg = ui_map_load(run)
+                return overlay, boxes, msg
 
-        # ---------- TAB 2 ----------
-        with gr.Tab("2) Detectare YOLO → GPS → CSV"):
+            btn_load_map.click(_load_map, inputs=[run_state],
+                               outputs=[pano_map, boxes_view, info_click])
+
+            # click anywhere on pano => lat/lon
+            pano_map.select(ui_map_click, inputs=[run_state, cb_open_maps, zoom_slider], outputs=[info_click])
+            btn_open_first.click(ui_first_detection_open, inputs=[run_state, cb_open_maps, zoom_slider], outputs=[info_click])
+
+        # -------------------- Dashboard #3 (Faults) --------------------
+        with gr.Tab("Dashboard #3"):
+            gr.Markdown("### Fault detection per image (detector or simulator)")
             with gr.Row():
-                y_img_dir = gr.Textbox(value=INPUT_DIR, label="Director imagini")
-                y_model   = gr.Textbox(value="best_model.pt", label="Model YOLO (.pt)")
+                det_mode = gr.Radio(choices=["detect", "simulate"], value="detect", label="Mode")
+                y_weights = gr.Textbox(value="", label="YOLO weights (.pt/.pth)")
+                y_data = gr.Textbox(value="", label="data.yaml (optional names override)")
             with gr.Row():
-                y_meta    = gr.Textbox(value=os.path.join(OUT_DIR, "catalog_metadate.csv"), label="CSV metadate (din Tab 1)")
-                y_out     = gr.Textbox(value=os.path.join(OUT_DIR, "rezultate_defecte.csv"), label="CSV rezultate")
-            with gr.Row():
-                y_conf = gr.Slider(0.05, 0.9, value=0.25, step=0.01, label="CONF_THRES")
-                y_iou  = gr.Slider(0.05, 0.9, value=0.45, step=0.01, label="IOU_THRES")
-            match_by_stem = gr.Checkbox(
-                value=True,
-                label="Potrivește metadatele din catalog după 'stem' (nume fără extensie)"
-            )
-            ignore_exif = gr.Checkbox(
-                value=True,
-                label="Ignoră EXIF (folosește doar catalogul)"
-            )
-    
-            gr.Markdown("**Referință BL (colț jos‑stânga a primei imagini)**")
-            with gr.Row():
-                ref_lat = gr.Number(value=44.880175, label="REF_BL_LAT")
-                ref_lon = gr.Number(value=25.533855, label="REF_BL_LON")
-            with gr.Accordion("Opțional", open=False):
-                origin_name = gr.Textbox(value="", label="ORIGIN_IMAGE_NAME (exact)")
-                agl_override = gr.Number(value=None, label="AGL_OVERRIDE_M (m) — dacă vrei să înlocuiești altitudinea")
-                focal_override = gr.Number(value=4.0, label="FOCAL_OVERRIDE_MM (mm) sau None")
+                y_classes = gr.Textbox(value="", label="Classes (e.g. '0,1' or 'fault,crack')")
+                y_imgsz = gr.Slider(320, 1536, value=640, step=32, label="imgsz")
+                y_conf  = gr.Slider(0.05, 0.9, value=0.25, step=0.01, label="conf")
+                y_iou   = gr.Slider(0.05, 0.9, value=0.45, step=0.01, label="iou")
+                y_maxd  = gr.Slider(50, 1000, value=300, step=10, label="max_det")
+            btn_run2 = gr.Button("Run Step 2 (Detect/Simulate + Project)", variant="primary")
 
-            btn_yolo = gr.Button("Rulează YOLO→GPS")
-            yolo_file = gr.File(label="CSV rezultat")
-            yolo_table = gr.Dataframe(label="Previzualizare rezultate", wrap=True)
+            det_overlay = gr.Image(label="Pano overlay", interactive=False)
+            det_boxes_json = gr.File(label="Projected boxes JSON")
+            det_stats = gr.JSON(label="Stats")
+            det_gallery = gr.Gallery(label="Per-image detections (if saved)").style(grid=[3], height="auto")
 
-            btn_yolo.click(
-                ui_run_yolo,
-                [y_img_dir, y_model, y_meta, y_out, y_conf, y_iou, ref_lat, ref_lon, origin_name, agl_override, focal_override, match_by_stem, ignore_exif],
-                [yolo_file, yolo_table]
-            ).then(lambda df: df, inputs=[yolo_table], outputs=[state_df])
+            def _run_step2(run, mode, weights, data, classes, imgsz, conf, iou, max_det):
+                overlay, boxes_json, stats = ui_step2_detect(run, mode, weights, data, classes, int(imgsz), float(conf), float(iou), int(max_det))
+                # build a simple gallery from det_vis dir
+                gallery = []
+                if stats.get("det_vis_dir") and os.path.isdir(stats["det_vis_dir"]):
+                    for fn in sorted(os.listdir(stats["det_vis_dir"]))[:60]:
+                        if fn.lower().endswith((".jpg",".png",".jpeg",".webp")):
+                            gallery.append(os.path.join(stats["det_vis_dir"], fn))
+                return overlay or None, boxes_json or None, stats, gallery
 
-        # ---------- TAB 3 ----------
-        with gr.Tab("3) Construiește panoramă (SuperGlue)"):
-            with gr.Row():
-                p_img_dir = gr.Textbox(value=INPUT_DIR, label="Director imagini panoramă")
-                sp_w = gr.Textbox(value="", label="SUPERPOINT_WEIGHTS")
-            with gr.Row():
-                sg_w = gr.Textbox(value="", label="SUPERGLUE_WEIGHTS")
-                proj_root = gr.Textbox(value="", label="PROJECT_ROOT (repo SuperGlue)")
-            with gr.Row():
-                p_out = gr.Textbox(value=os.path.join(OUT_DIR, "panorama.png"), label="Ieșire panoramă")
-            with gr.Row():
-                th = gr.Slider(600, 2400, value=1200, step=10, label="TARGET_H")
-                tw = gr.Slider(800, 4000, value=1600, step=10, label="TARGET_W")
+            btn_run2.click(_run_step2, inputs=[run_state, det_mode, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
+                           outputs=[det_overlay, det_boxes_json, det_stats, det_gallery])
 
-            btn_pano = gr.Button("Generează panoramă")
-            pano_preview = gr.Image(label="Previzualizare panoramă", interactive=False)
-
-            btn_pano.click(ui_build_pano, [p_img_dir, sp_w, sg_w, proj_root, p_out, th, tw], [pano_preview])
-
-        # ---------- TAB 4 ----------
-        with gr.Tab("4) Vizualizare • panoramă + defecte"):
-            with gr.Row():
-                v_pano = gr.Image(type="filepath", label="Panoramă (PNG/JPG)")
-                v_csv  = gr.File(label="CSV defecte (din Tab 2)")
-
-            btn_draw = gr.Button("Încarcă și desenează pini")
-            pano_with_pins = gr.Image(label="Panoramă cu pini (click pentru Maps)", interactive=True)
-            has_pano_flag = gr.Textbox(label="CSV conține coloane pano_x_px / pano_y_px?", interactive=False)
-            csv_view = gr.Dataframe(label="CSV", wrap=True)
-            click_info = gr.Markdown()
-
-            def _load_and_draw(pano_path, csv_file):
-                path = csv_file.name if csv_file else ""
-                img, df, has_pano = draw_pins(pano_path, path)
-                return img, ("Da" if has_pano else "Nu"), df, df
-
-            btn_draw.click(_load_and_draw, [v_pano, v_csv], [pano_with_pins, has_pano_flag, csv_view, state_df])
-
-            pano_with_pins.select(ui_click_on_image, [state_df], [click_info])
-
-    gr.Markdown("—\nTips: setează căile absolute Windows (ex: `C:\\\\Users\\\\Sorin\\\\...`).")
+    gr.Markdown("---\nTips: Use **Dashboard #2** to click anywhere on the pano and get **lat/lon** (toggle “Open Google Maps on click”).")
 
 if __name__ == "__main__":
     demo.launch()
