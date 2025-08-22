@@ -25,7 +25,8 @@ def angle_from_yaw(exifs):
     return float(a)
 
 def rotate_affine(img,angle_ccw):
-    if abs(angle_ccw)<1e-8: return img,np.eye(3,np.float64)[:2,:]
+    if abs(angle_ccw) < 1e-8:
+        return img, np.eye(3, dtype=np.float64)[:2, :]
     h,w=img.shape[:2]; c=(w/2.0,h/2.0)
     M=cv.getRotationMatrix2D(c,angle_ccw,1.0)
     cs,sn=abs(M[0,0]),abs(M[0,1])
