@@ -3,7 +3,7 @@ from PIL import Image
 
 def _rf(x):
     try: return float(x.num)/float(x.den)
-    except: 
+    except:
         try: return float(x)
         except: return None
 
@@ -15,26 +15,30 @@ def _dms(vals, ref):
         return float(v)
     except: return None
 
-_XMP_NUM=rb'([+\-]?\d+(?:\.\d+)?)'
-def _read_dji_xmp(path):
+def _extract_xmp_yaw_bytes(b):
     try:
-        with open(path,'rb') as f: data=f.read()
-        def grab(*names):
-            for n in names:
-                m=re.search(rb'[\w\-:]*'+n+rb'\s*=\s*"'+_XMP_NUM+rb'"',data)
-                if m: return float(m.group(1).decode('ascii'))
-            return None
-        lat=grab(b'GpsLatitude'); lon=grab(b'GpsLongitude')
-        gy=grab(b'GimbalYawDegree'); fy=grab(b'FlightYawDegree'); yaw=gy if gy is not None else fy
-        ra=grab(b'RelativeAltitude'); aa=grab(b'AbsoluteAltitude'); alt=ra if ra is not None else aa
-        return {'lat':lat,'lon':lon,'yaw_deg':yaw,'alt_m':alt}
-    except: return {'lat':None,'lon':None,'yaw_deg':None,'alt_m':None}
+        i=b.find(b"<x:xmpmeta")
+        if i<0: return None,None
+        j=b.find(b"</x:xmpmeta>",i)
+        if j<0: return None,None
+        s=b[i:j+12].decode("utf-8","ignore")
+        mF=re.search(r'(?:drone-dji:|dji:|DJI[^:]*:)?FlightYawDegree="([+\-]?\d+(?:\.\d+)?)"',s)
+        mG=re.search(r'(?:drone-dji:|dji:|DJI[^:]*:)?GimbalYawDegree="([+\-]?\d+(?:\.\d+)?)"',s)
+        fy=float(mF.group(1)) if mF else None
+        gy=float(mG.group(1)) if mG else None
+        return fy,gy
+    except:
+        return None,None
 
 def read_meta(path):
-    d={'lat':None,'lon':None,'yaw_deg':None,'alt_m':0.0,'w':0,'h':0,'focal_mm':0.0,'focal35mm':0.0}
-    with open(path,'rb') as f: tags=exifread.process_file(f,details=False)
+    d={'lat':0.0,'lon':0.0,'yaw_deg':0.0,'alt_m':0.0,'w':0,'h':0,'focal_mm':0.0,'focal35mm':0.0}
+    with open(path,'rb') as f:
+        raw=f.read()
+        f.seek(0)
+        tags=exifread.process_file(f,details=False)
+
     def get(n):
-        t=tags.get(n); 
+        t=tags.get(n)
         if t is None: return None
         try:
             v=getattr(t,'values',t)
@@ -43,22 +47,30 @@ def read_meta(path):
         except:
             try: return float(str(t))
             except: return None
-    d['focal_mm']=get('EXIF FocalLength') or 0.0
-    d['focal35mm']=get('EXIF FocalLengthIn35mmFilm') or 0.0
-    alt=get('GPS GPSAltitude'); d['alt_m']=alt if alt is not None else 0.0
-    for k in ['XMP GimbalYawDegree','XMP FlightYawDegree','MakerNote Yaw','Image Tag 0x0011']:
-        v=get(k)
-        if v is not None: d['yaw_deg']=v; break
+
+    v=get('EXIF FocalLength'); d['focal_mm']=v if v is not None else 0.0
+    v=get('EXIF FocalLengthIn35mmFilm'); d['focal35mm']=v if v is not None else 0.0
+    v=get('GPS GPSAltitude'); d['alt_m']=v if v is not None else 0.0
+
     latv=tags.get('GPS GPSLatitude'); latr=tags.get('GPS GPSLatitudeRef')
     lonv=tags.get('GPS GPSLongitude'); lonr=tags.get('GPS GPSLongitudeRef')
     if latv and lonv and latr and lonr:
-        d['lat']=_dms(getattr(latv,'values',[]),latr)
-        d['lon']=_dms(getattr(lonv,'values',[]),lonr)
-    if d['lat'] is None or d['lon'] is None or d['yaw_deg'] is None or d['alt_m'] in (None,0.0):
-        x=_read_dji_xmp(path)
-        for k in ['lat','lon','yaw_deg','alt_m']:
-            if d.get(k) in (None,0.0) and x.get(k) not in (None,0.0): d[k]=x[k]
-    with Image.open(path) as im: d['w'],d['h']=im.size
+        lat=_dms(getattr(latv,'values',[]),latr); lon=_dms(getattr(lonv,'values',[]),lonr)
+        d['lat']=lat if lat is not None else 0.0
+        d['lon']=lon if lon is not None else 0.0
+
+    fy,gy=_extract_xmp_yaw_bytes(raw)
+    if fy is not None: d['yaw_deg']=fy
+    elif gy is not None: d['yaw_deg']=gy
+    else:
+        for k in ['XMP FlightYawDegree','XMP GimbalYawDegree','MakerNote Yaw','Image Tag 0x0011']:
+            v=get(k)
+            if v is not None: d['yaw_deg']=v; break
+
+    with Image.open(path) as im:
+        d['w'],d['h']=im.size
+    for k in ['lat','lon','alt_m','focal_mm','focal35mm','yaw_deg']:
+        if d.get(k) is None: d[k]=0.0
     return d
 
 def sensor_width_mm(f_mm,f35): return 36.0*f_mm/f35 if (f_mm>0 and f35>0) else None

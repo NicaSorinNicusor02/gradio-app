@@ -39,13 +39,7 @@ class GeoMapper:
         return 0.0, A, epsg
 
     def orient_and_world(self, pano, phi_deg, A_world, epsg, out_path):
-        """
-        Flip-free orientation:
-          - Rotate panorama only (legacy negative sign kept).
-          - Adjust A_world into the rotated frame.
-          - Never apply horizontal/vertical flips.
-        """
-        # Rotate (keeping your original negative sign convention)
+
         pano_rot, M = rotate_affine(pano, -phi_deg)
         R3 = np.eye(3); R3[:2, :] = M
 
