@@ -17,25 +17,50 @@ def _dms(vals, ref):
 
 def _extract_xmp_yaw_bytes(b):
     try:
-        i=b.find(b"<x:xmpmeta")
-        if i<0: return None,None
-        j=b.find(b"</x:xmpmeta>",i)
-        if j<0: return None,None
-        s=b[i:j+12].decode("utf-8","ignore")
-        mF=re.search(r'(?:drone-dji:|dji:|DJI[^:]*:)?FlightYawDegree="([+\-]?\d+(?:\.\d+)?)"',s)
-        mG=re.search(r'(?:drone-dji:|dji:|DJI[^:]*:)?GimbalYawDegree="([+\-]?\d+(?:\.\d+)?)"',s)
-        fy=float(mF.group(1)) if mF else None
-        gy=float(mG.group(1)) if mG else None
-        return fy,gy
+        i = b.find(b"<x:xmpmeta")
+        if i < 0:
+            return None, None
+        j = b.find(b"</x:xmpmeta>", i)
+        if j < 0:
+            return None, None
+        s = b[i:j+12].decode("utf-8", "ignore")
+
+        import re
+        vals = {}
+
+        # Attribute form:  <... FlightYawDegree="-139.70" ...>
+        for m in re.finditer(r'(?:[\w\-]+:)?(FlightYawDegree|GimbalYawDegree)="([+\-]?\d+(?:\.\d+)?)"', s):
+            vals[m.group(1)] = float(m.group(2))
+
+        # Element form:  <drone-dji:FlightYawDegree>-139.70</drone-dji:FlightYawDegree>
+        for m in re.finditer(r'<(?:[\w\-]+:)?(FlightYawDegree|GimbalYawDegree)>\s*([+\-]?\d+(?:\.\d+)?)\s*</(?:[\w\-]+:)?\1>', s):
+            if m.group(1) not in vals:
+                vals[m.group(1)] = float(m.group(2))
+
+        fy = vals.get("FlightYawDegree")
+        gy = vals.get("GimbalYawDegree")
+        return fy, gy
     except:
-        return None,None
+        return None, None
+
+def _orient_deg(tags):
+    t=tags.get('Image Orientation')
+    if t is None: return 0.0
+    try:
+        v=int(str(t).split()[0])
+    except:
+        try: v=int(str(t))
+        except: return 0.0
+    if v==1: return 0.0
+    if v==3: return 180.0
+    if v==6: return -90.0
+    if v==8: return 90.0
+    return 0.0
 
 def read_meta(path):
     d={'lat':0.0,'lon':0.0,'yaw_deg':0.0,'alt_m':0.0,'w':0,'h':0,'focal_mm':0.0,'focal35mm':0.0}
     with open(path,'rb') as f:
-        raw=f.read()
-        f.seek(0)
-        tags=exifread.process_file(f,details=False)
+        raw=f.read(); f.seek(0); tags=exifread.process_file(f,details=False)
 
     def get(n):
         t=tags.get(n)
@@ -60,12 +85,16 @@ def read_meta(path):
         d['lon']=lon if lon is not None else 0.0
 
     fy,gy=_extract_xmp_yaw_bytes(raw)
-    if fy is not None: d['yaw_deg']=fy
-    elif gy is not None: d['yaw_deg']=gy
-    else:
+    yaw=fy if fy is not None else (gy if gy is not None else None)
+    if yaw is None:
         for k in ['XMP FlightYawDegree','XMP GimbalYawDegree','MakerNote Yaw','Image Tag 0x0011']:
             v=get(k)
-            if v is not None: d['yaw_deg']=v; break
+            if v is not None:
+                yaw=v; break
+
+    rot=_orient_deg(tags)
+    if yaw is None: yaw=0.0
+    d['yaw_deg']=float(yaw - rot)
 
     with Image.open(path) as im:
         d['w'],d['h']=im.size
