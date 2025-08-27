@@ -1,0 +1,6 @@
+nc: 4
+names:
+  - no_damage
+  - physical_damage 
+  - electrical_damage
+  - Hotspot

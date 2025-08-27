@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os, sys
+import threading
+import tempfile, shutil
 import gradio as gr
 
 # Make sure core/ is importable when running from project root
@@ -12,7 +14,7 @@ from utils import validate_and_copy, attach_gcps
 from services import (
     run_detector_or_sim, sim_init, sim_change_frame, sim_click, sim_undo, sim_clear, sim_save,
     friendly_summary, pdf_report, do_stitch_and_project, map_click,
-    faults_table, build_fault_index, render_fault_image,
+    faults_table, build_fault_index, render_fault_image, build_fault_cards,
 )
 
 # ---- Old color template (dark) ----
@@ -55,6 +57,8 @@ def build_ui():
         current_fault_idx  = gr.State(0)
         pano_overlay_state = gr.State("")
         pano_png_state     = gr.State("")
+        det_tmp_state      = gr.State("")
+        faults_loaded_state = gr.State(False)
 
         # ---------- Simple nav helpers (toggle page visibility) ----------
         def show_data():    return (gr.update(visible=True),  gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
@@ -72,70 +76,104 @@ def build_ui():
         with page_data:
             gr.Markdown("### Data Loading", elem_classes=["section-title"])
             with gr.Row():
-                uploads   = gr.File(file_count="multiple", file_types=["image"], label="Images")
-                gcps_file = gr.File(file_types=[".json"], label="GCPs (optional)")
-            with gr.Row():
-                simulate_ck = gr.Checkbox(value=False, label="Simulation (manual boxes)")
-                y_weights   = gr.Textbox(value="", label="YOLO weights (.pt/.pth)")
-                y_data      = gr.Textbox(value="", label="data.yaml (optional)")
-                y_classes   = gr.Textbox(value="", label="Classes")
-            with gr.Row():
-                y_imgsz = gr.Slider(320, 1536, value=640, step=32, label="imgsz")
-                y_conf  = gr.Slider(0.05, 0.9, value=0.25, step=0.01, label="conf")
-                y_iou   = gr.Slider(0.05, 0.9, value=0.45, step=0.01, label="iou")
-                y_maxd  = gr.Slider(50, 1000, value=300, step=10, label="max_det")
+                uploads = gr.File(file_count="multiple", file_types=["image", ".json"], label="Images and GCPs.json")
 
             btn_copy = gr.Button("Load Files")
             log_copy = gr.Markdown()
-            btn_gcps = gr.Button("Save GCPs")
-            gcps_info = gr.Markdown()
-            btn_detect = gr.Button("Run Detector / Enable Simulation")
-            det_status = gr.Markdown()
+            gcps_auto_info = gr.Markdown()
+
+            # Hidden holder for detections path (used by Simulation Save)
             det_json_path = gr.Textbox(visible=False)
 
-            btn_copy.click(lambda files: validate_and_copy(files), inputs=[uploads], outputs=[run_state, log_copy])
-            btn_gcps.click(attach_gcps, inputs=[run_state, gcps_file], outputs=[gcps_state, gcps_info])
+            def _filter_and_copy(files):
+                files = files or []
+                def _name(x):
+                    try:
+                        return getattr(x, "name", str(x))
+                    except Exception:
+                        return str(x)
+                image_exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif")
+                img_files = [f for f in files if _name(f).lower().endswith(image_exts)]
+                return validate_and_copy(img_files)
 
-            def _run_det_or_sim(run, sim, w, data, classes, imgsz, conf, iou, max_det):
-                msg, detp = run_detector_or_sim(run, sim, w, data, classes, int(imgsz), float(conf), float(iou), int(max_det))
-                return msg, detp
-            btn_detect.click(
-                _run_det_or_sim,
-                inputs=[run_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
-                outputs=[det_status, det_json_path]
-            )
+            def _load_files_and_gcps(files):
+                run, log = _filter_and_copy(files)
+                files = files or []
+                def _name(x):
+                    try:
+                        return getattr(x, "name", str(x))
+                    except Exception:
+                        return str(x)
+                json_files = [f for f in files if _name(f).lower().endswith(".json")]
+                if json_files and run:
+                    g_state, g_info = attach_gcps(run, json_files[0])
+                else:
+                    g_state, g_info = "", ""
+                return run, log, g_state, g_info
 
-            # Simulation subpanel
-            with gr.Accordion("Simulation Annotator", open=False) as sim_panel:
+            btn_copy.click(_load_files_and_gcps, inputs=[uploads], outputs=[run_state, log_copy, gcps_state, gcps_auto_info])
+
+            # Advanced settings hidden by default
+            with gr.Accordion("Advanced", open=False):
                 with gr.Row():
-                    frame_dd = gr.Dropdown(choices=[], value=None, label="Frame")
-                    sim_img  = gr.Image(label="Annotate", interactive=True, height=560)
-                sim_help = gr.Markdown()
-                btn_init = gr.Button("Init")
+                    simulate_ck = gr.Checkbox(value=False, label="Simulation (manual boxes)")
+                    y_weights   = gr.Textbox(value="model.pt", label="YOLO weights (.pt/.pth)")
+                    y_data      = gr.Textbox(value="", label="data.yaml (optional)")
+                    y_classes   = gr.Textbox(value="", label="Classes")
                 with gr.Row():
-                    btn_undo = gr.Button("Undo"); btn_clear = gr.Button("Clear")
-                with gr.Row():
-                    sim_label = gr.Textbox(value="manual", label="Label")
-                    sim_score = gr.Slider(0.1, 1.0, value=1.0, step=0.05, label="Score")
-                    btn_save  = gr.Button("Save detections.json")
-                sim_save_info = gr.Markdown()
+                    y_imgsz = gr.Slider(320, 1536, value=640, step=32, label="imgsz")
+                    y_conf  = gr.Slider(0.05, 0.9, value=0.25, step=0.01, label="conf")
+                    y_iou   = gr.Slider(0.05, 0.9, value=0.45, step=0.01, label="iou")
+                    y_maxd  = gr.Slider(50, 1000, value=300, step=10, label="max_det")
 
-                def _toggle_sim(vis): return gr.update(open=bool(vis))
-                simulate_ck.change(_toggle_sim, inputs=[simulate_ck], outputs=[sim_panel])
+                # Optional: Save GCPs picked from the combined uploads
+                btn_gcps = gr.Button("Save GCPs")
+                gcps_info = gr.Markdown()
 
-                btn_init.click(sim_init, inputs=[run_state], outputs=[frame_dd, sim_img, sim_state, sim_help])
-                sim_img.select(sim_click, inputs=[run_state, frame_dd, click_state, sim_state], outputs=[sim_img, click_state, sim_state])
-                btn_undo.click(sim_undo, inputs=[run_state, frame_dd, sim_state], outputs=[sim_img, sim_state])
-                btn_clear.click(sim_clear, inputs=[run_state, frame_dd, sim_state], outputs=[sim_img, sim_state])
-                frame_dd.change(lambda run, name: sim_change_frame(run, name, sim_state.value or {})[0],
-                                inputs=[run_state, frame_dd], outputs=[sim_img])
-                btn_save.click(sim_save, inputs=[run_state, sim_state, sim_label, sim_score], outputs=[sim_save_info, det_json_path])
+                def _attach_gcps_wrapper(run, files):
+                    files = files or []
+                    def _name(x):
+                        try:
+                            return getattr(x, "name", str(x))
+                        except Exception:
+                            return str(x)
+                    json_files = [f for f in files if _name(f).lower().endswith(".json")]
+                    gcps = json_files[0] if json_files else None
+                    return attach_gcps(run, gcps)
+
+                btn_gcps.click(_attach_gcps_wrapper, inputs=[run_state, uploads], outputs=[gcps_state, gcps_info])
+
+                # Simulation subpanel
+                with gr.Accordion("Simulation Annotator", open=False) as sim_panel:
+                    with gr.Row():
+                        frame_dd = gr.Dropdown(choices=[], value=None, label="Frame")
+                        sim_img  = gr.Image(label="Annotate", interactive=True, height=560)
+                    sim_help = gr.Markdown()
+                    btn_init = gr.Button("Init")
+                    with gr.Row():
+                        btn_undo = gr.Button("Undo"); btn_clear = gr.Button("Clear")
+                    with gr.Row():
+                        sim_label = gr.Textbox(value="manual", label="Label")
+                        sim_score = gr.Slider(0.1, 1.0, value=1.0, step=0.05, label="Score")
+                        btn_save  = gr.Button("Save detections.json")
+                    sim_save_info = gr.Markdown()
+
+                    def _toggle_sim(vis): return gr.update(open=bool(vis))
+                    simulate_ck.change(_toggle_sim, inputs=[simulate_ck], outputs=[sim_panel])
+
+                    btn_init.click(sim_init, inputs=[run_state], outputs=[frame_dd, sim_img, sim_state, sim_help])
+                    sim_img.select(sim_click, inputs=[run_state, frame_dd, click_state, sim_state], outputs=[sim_img, click_state, sim_state])
+                    btn_undo.click(sim_undo, inputs=[run_state, frame_dd, sim_state], outputs=[sim_img, sim_state])
+                    btn_clear.click(sim_clear, inputs=[run_state, frame_dd, sim_state], outputs=[sim_img, sim_state])
+                    frame_dd.change(lambda run, name: sim_change_frame(run, name, sim_state.value or {})[0],
+                                    inputs=[run_state, frame_dd], outputs=[sim_img])
+                    btn_save.click(sim_save, inputs=[run_state, sim_state, sim_label, sim_score], outputs=[sim_save_info, det_json_path])
+
+            # (Run Analysis button removed; detection will run when navigating to Summary if needed)
 
             # Quick nav from Data -> Summary
             with gr.Row(elem_classes=["nav-row"]):
-                gr.Button("View Summary", elem_classes=["navbtn"]).click(
-                    lambda: show_summary(), outputs=[page_data, page_summary, page_map, page_faults]
-                )
+                btn_nav_summary_from_data = gr.Button("View Summary", elem_classes=["navbtn"]) 
 
         # =================== PAGE: MAP (reverted with zoom slider) ===================
         with page_map:
@@ -143,7 +181,8 @@ def build_ui():
             btn_stitch = gr.Button("Stitch & Project")
 
             # Use a plain Image that expects a *filepath*
-            pano_map   = gr.Image(type="filepath", label="Panorama", interactive=True, height=640)
+            pano_map   = gr.Image(type="filepath", label="Panorama", interactive=True, height=640,
+                                  sources=[], show_download_button=True, show_fullscreen_button=True)
             map_info   = gr.Markdown()
             with gr.Row():
                 cb_open_maps = gr.Checkbox(value=False, label="Open Google Maps on click")
@@ -166,12 +205,8 @@ def build_ui():
 
             # Bottom nav buttons
             with gr.Row(elem_classes=["nav-row"]):
-                gr.Button("View Summary", elem_classes=["navbtn"]).click(
-                    lambda: show_summary(), outputs=[page_data, page_summary, page_map, page_faults]
-                )
-                gr.Button("View Faults", elem_classes=["navbtn"]).click(
-                    lambda: show_faults(), outputs=[page_data, page_summary, page_map, page_faults]
-                )
+                btn_nav_summary_from_map = gr.Button("View Summary", elem_classes=["navbtn"]) 
+                btn_nav_faults_from_map  = gr.Button("View Faults", elem_classes=["navbtn"]) 
 
         # =================== PAGE: SUMMARY ===================
         with page_summary:
@@ -181,8 +216,20 @@ def build_ui():
             table = gr.Dataframe(headers=["ImageIndex", "Class", "Severity", "Analysis"], row_count=10, wrap=True)
             btn_pdf   = gr.Button("Download Report (PDF)")
             pdf_file  = gr.File(label="Report", interactive=False)
+            det_json_file = gr.File(label="Detections JSON", interactive=False)
 
-            btn_refresh.click(lambda run: friendly_summary(run), inputs=[run_state], outputs=[summary_md, table])
+            def _summary_and_det(run, tmp_path):
+                md, rows = friendly_summary(run)
+                # Prefer temp file if exists, otherwise run detections.json if present
+                if tmp_path and os.path.isfile(tmp_path):
+                    det_path = tmp_path
+                else:
+                    det_path = os.path.join(run or "", "detections.json") if run else ""
+                    if not (det_path and os.path.isfile(det_path)):
+                        det_path = None
+                return md, rows, det_path
+
+            btn_refresh.click(_summary_and_det, inputs=[run_state, det_tmp_state], outputs=[summary_md, table, det_json_file])
             btn_pdf.click(lambda run: pdf_report(run), inputs=[run_state], outputs=[pdf_file])
 
             # Bottom nav buttons
@@ -190,77 +237,111 @@ def build_ui():
                 gr.Button("View Map", elem_classes=["navbtn"]).click(
                     lambda: show_map(), outputs=[page_data, page_summary, page_map, page_faults]
                 )
-                gr.Button("View Faults", elem_classes=["navbtn"]).click(
-                    lambda: show_faults(), outputs=[page_data, page_summary, page_map, page_faults]
-                )
+                btn_nav_faults_from_summary = gr.Button("View Faults", elem_classes=["navbtn"]) 
 
         # =================== PAGE: FAULTS ===================
         with page_faults:
             gr.Markdown("### Faults", elem_classes=["section-title"])
             btn_load_faults = gr.Button("Load")
-            faults_md = gr.Markdown()
-            faults_tbl = gr.Dataframe(headers=["Image", "Class", "Score", "Severity", "Analysis"], row_count=10, wrap=True)
-            with gr.Row():
-                img_name_dd = gr.Dropdown(choices=[], label="Image")
-                btn_prev_img = gr.Button("Prev"); btn_next_img = gr.Button("Next")
-            img_preview = gr.Image(label="", interactive=False, height=560)
+            cards = gr.Gallery(label="Fault Cards", columns=[3], height=560)
 
             def _load_faults(run):
                 names, det_index, files = build_fault_index(run)
                 if names:
-                    rows_all, msg, _ = faults_table(run)
-                    first_idx_val = names[0][1]
-                    img, _rows_first = render_fault_image(files, first_idx_val, det_index)
-                    return (msg, rows_all,
-                            gr.update(choices=[n for n, _ in names], value=names[0][0]),
-                            img, {"names": names, "index": det_index, "files": files}, first_idx_val)
-                return ("No detections.", [], gr.update(choices=[], value=None), None,
-                        {"names": [], "index": {}, "files": []}, 0)
+                    gallery = build_fault_cards(run)
+                    return (gallery, {"names": names, "index": det_index, "files": files}, True)
+                return ([], {"names": [], "index": {}, "files": []}, True)
 
             btn_load_faults.click(_load_faults, inputs=[run_state],
-                                  outputs=[faults_md, faults_tbl, img_name_dd, img_preview, faults_state, current_fault_idx])
+                                  outputs=[cards, faults_state, faults_loaded_state])
 
-            def _select_name(name, state):
-                names = state.get("names", [])
-                files = state.get("files", [])
-                det_index = state.get("index", {})
-                if not names: return None, 0
-                map_names = {n: i for n, i in names}
-                idx = map_names.get(name, names[0][1])
-                img, rows = render_fault_image(files, idx, det_index)
-                return img, idx
-
-            img_name_dd.change(_select_name, inputs=[img_name_dd, faults_state],
-                               outputs=[img_preview, current_fault_idx])
-
-            def _step(delta, state, cur_idx):
-                names = state.get("names", [])
-                files = state.get("files", [])
-                det_index = state.get("index", {})
-                if not names: return gr.update(), cur_idx, None
-                order = [i for _, i in names]
-                if cur_idx not in order: cur_idx = order[0]
-                j = max(0, min(len(order) - 1, order.index(cur_idx) + delta))
-                new_idx = order[j]
-                new_name = [n for n, i in names if i == new_idx][0]
-                img, rows = render_fault_image(files, new_idx, det_index)
-                return gr.update(value=new_name), new_idx, img
-
-            btn_prev_img.click(lambda *args: _step(-1, *args),
-                               inputs=[faults_state, current_fault_idx],
-                               outputs=[img_name_dd, current_fault_idx, img_preview])
-            btn_next_img.click(lambda *args: _step(+1, *args),
-                               inputs=[faults_state, current_fault_idx],
-                               outputs=[img_name_dd, current_fault_idx, img_preview])
+            # (Old image navigation removed)
 
             # Bottom nav buttons
             with gr.Row(elem_classes=["nav-row"]):
-                gr.Button("View Summary", elem_classes=["navbtn"]).click(
-                    lambda: show_summary(), outputs=[page_data, page_summary, page_map, page_faults]
-                )
+                btn_nav_summary_from_faults = gr.Button("View Summary", elem_classes=["navbtn"]) 
                 gr.Button("View Map", elem_classes=["navbtn"]).click(
                     lambda: show_map(), outputs=[page_data, page_summary, page_map, page_faults]
                 )
+
+        # ---- Nav helpers that also refresh content ----
+        def _summary_and_det(run, tmp_path):
+            md, rows = friendly_summary(run)
+            if tmp_path and os.path.isfile(tmp_path):
+                det_path = tmp_path
+            else:
+                det_path = os.path.join(run or "", "detections.json") if run else ""
+                if not (det_path and os.path.isfile(det_path)):
+                    det_path = None
+            return md, rows, det_path
+
+        def _kickoff_stitch(run):
+            try:
+                threading.Thread(target=lambda: do_stitch_and_project(run, reuse=True), daemon=True).start()
+            except Exception:
+                pass
+
+        def _nav_summary(run, tmp_path, sim, w, data, classes, imgsz, conf, iou, max_det):
+            v = show_summary()
+            # Ensure detections exist; if not, run detector with provided/Default params
+            det_json = os.path.join(run or "", "detections.json") if run else ""
+            if not (det_json and os.path.isfile(det_json)):
+                # Default weights fallback
+                w = w or "model.pt"
+                try:
+                    _msg, detp_new = run_detector_or_sim(run, bool(sim), w, data, classes, int(imgsz), float(conf), float(iou), int(max_det))
+                    # Invalidate faults cache on new detections
+                    faults_loaded_state.value = False
+                    det_json = detp_new or det_json
+                    # Update a temp copy for download convenience
+                    if detp_new and os.path.isfile(detp_new):
+                        fd, tpath = tempfile.mkstemp(suffix=".json", prefix="detections_")
+                        os.close(fd)
+                        shutil.copyfile(detp_new, tpath)
+                        det_tmp_state.value = tpath
+                except Exception:
+                    pass
+            # Start stitching in background so UI remains responsive
+            _kickoff_stitch(run)
+            md, rows, detp = _summary_and_det(run, det_tmp_state.value or tmp_path)
+            return (*v, md, rows, detp)
+
+        def _nav_faults(run, loaded):
+            v = show_faults()
+            if loaded:
+                # Only toggle visibility; keep existing content
+                return (*v, gr.update(), gr.update(), loaded)
+            gallery, st, loaded_out = _load_faults(run)
+            return (*v, gallery, st, loaded_out)
+
+        # Wire nav buttons now that targets exist
+        btn_nav_summary_from_data.click(
+            _nav_summary,
+            inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
+            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file]
+        )
+        btn_nav_summary_from_map.click(
+            _nav_summary,
+            inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
+            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file]
+        )
+        btn_nav_faults_from_map.click(
+            _nav_faults,
+            inputs=[run_state, faults_loaded_state],
+            outputs=[page_data, page_summary, page_map, page_faults, cards, faults_state, faults_loaded_state]
+        )
+        btn_nav_faults_from_summary.click(
+            _nav_faults,
+            inputs=[run_state, faults_loaded_state],
+            outputs=[page_data, page_summary, page_map, page_faults, cards, faults_state, faults_loaded_state]
+        )
+        btn_nav_summary_from_faults.click(
+            _nav_summary,
+            inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
+            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file]
+        )
+
+        # (Preview removed as requested)
 
     return demo
 
