@@ -42,6 +42,16 @@ button{border-radius:12px}
   box-shadow: 0 0 0 2px #22d3ee inset, 0 0 24px rgba(34,211,238,.55);
   transform: translateY(-1px);
 }
+.faults-scroller{
+  height: 560px;           /* ca înainte */
+  overflow-y: auto;        /* scroll intern */
+  padding-right: 8px;      /* spațiu pentru bară */
+}
+
+/* (opțional) stil pentru scrollbar – Chrome/Edge */
+.faults-scroller::-webkit-scrollbar{ width: 10px; }
+.faults-scroller::-webkit-scrollbar-thumb{ background: #22d3ee88; border-radius: 8px; }
+.faults-scroller::-webkit-scrollbar-track{ background: transparent; }
 """
 
 def build_ui():
@@ -184,6 +194,7 @@ def build_ui():
             pano_map   = gr.Image(type="filepath", label="Panorama", interactive=True, height=640,
                                   sources=[], show_download_button=True, show_fullscreen_button=True)
             map_info   = gr.Markdown()
+            
             with gr.Row():
                 cb_open_maps = gr.Checkbox(value=False, label="Open Google Maps on click")
                 cb_use_gcps  = gr.Checkbox(value=True,  label="Use GCPs")
@@ -205,8 +216,11 @@ def build_ui():
 
             # Bottom nav buttons
             with gr.Row(elem_classes=["nav-row"]):
+                gr.Button("Back to Data", elem_classes=["navbtn"]).click(
+                    lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
+            )
                 btn_nav_summary_from_map = gr.Button("View Summary", elem_classes=["navbtn"]) 
-                btn_nav_faults_from_map  = gr.Button("View Faults", elem_classes=["navbtn"]) 
+                btn_nav_faults_from_map  = gr.Button("View Faults", elem_classes=["navbtn"])
 
         # =================== PAGE: SUMMARY ===================
         with page_summary:
@@ -237,13 +251,17 @@ def build_ui():
                 gr.Button("View Map", elem_classes=["navbtn"]).click(
                     lambda: show_map(), outputs=[page_data, page_summary, page_map, page_faults]
                 )
-                btn_nav_faults_from_summary = gr.Button("View Faults", elem_classes=["navbtn"]) 
+                btn_nav_faults_from_summary = gr.Button("View Faults", elem_classes=["navbtn"])
+                gr.Button("Back to Data", elem_classes=["navbtn"]).click(
+                lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
+                )
 
         # =================== PAGE: FAULTS ===================
         with page_faults:
             gr.Markdown("### Faults", elem_classes=["section-title"])
             btn_load_faults = gr.Button("Load")
-            cards = gr.Gallery(label="Fault Cards", columns=[3], height=560)
+            with gr.Group(elem_classes=["faults-scroller"]):
+                cards = gr.Gallery(label="Fault Cards", columns=[3])  # fără height aici
 
             def _load_faults(run):
                 names, det_index, files = build_fault_index(run)
@@ -259,10 +277,13 @@ def build_ui():
 
             # Bottom nav buttons
             with gr.Row(elem_classes=["nav-row"]):
+                gr.Button("Back to Data", elem_classes=["navbtn"]).click(
+                    lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
+                )
                 btn_nav_summary_from_faults = gr.Button("View Summary", elem_classes=["navbtn"]) 
                 gr.Button("View Map", elem_classes=["navbtn"]).click(
                     lambda: show_map(), outputs=[page_data, page_summary, page_map, page_faults]
-                )
+                )    
 
         # ---- Nav helpers that also refresh content ----
         def _summary_and_det(run, tmp_path):
