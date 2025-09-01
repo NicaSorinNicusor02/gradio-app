@@ -5,7 +5,7 @@ import cv2 as cv
 import gradio as gr
 import webbrowser 
 
-from utils import (
+from app_utils import (
     sorted_images, overlay_path, boxes_path, world_path, index_path, gcps_path,
     gcps_count
 )

@@ -1,23 +1,22 @@
-#!/usr/bin/env python3
 import os, sys
-import threading
 import tempfile, shutil
 import gradio as gr
 
-# Make sure core/ is importable when running from project root
 ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 CORE = os.path.join(ROOT, "core")
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
-from utils import validate_and_copy, attach_gcps
+from app_utils import validate_and_copy, attach_gcps
 from services import (
     run_detector_or_sim, sim_init, sim_change_frame, sim_click, sim_undo, sim_clear, sim_save,
     friendly_summary, pdf_report, do_stitch_and_project, map_click,
     faults_table, build_fault_index, render_fault_image, build_fault_cards,
 )
 
-# ---- Old color template (dark) ----
+# ---- Theme / CSS ----
 theme = gr.themes.Soft(
     primary_hue="indigo",
     secondary_hue="pink",
@@ -31,7 +30,7 @@ CSS = """
 .section-title{opacity:.9;margin:4px 0 12px 0}
 button{border-radius:12px}
 
-/* Bottom nav buttons — make them pop a bit */
+/* Bottom nav buttons */
 .nav-row{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
 .navbtn{
   background:transparent; color:#22d3ee; font-weight:700; border-radius:12px;
@@ -42,13 +41,13 @@ button{border-radius:12px}
   box-shadow: 0 0 0 2px #22d3ee inset, 0 0 24px rgba(34,211,238,.55);
   transform: translateY(-1px);
 }
-.faults-scroller{
-  height: 560px;           /* ca înainte */
-  overflow-y: auto;        /* scroll intern */
-  padding-right: 8px;      /* spațiu pentru bară */
-}
 
-/* (opțional) stil pentru scrollbar – Chrome/Edge */
+/* Faults scroller */
+.faults-scroller{
+  height: 560px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
 .faults-scroller::-webkit-scrollbar{ width: 10px; }
 .faults-scroller::-webkit-scrollbar-thumb{ background: #22d3ee88; border-radius: 8px; }
 .faults-scroller::-webkit-scrollbar-track{ background: transparent; }
@@ -59,24 +58,24 @@ def build_ui():
         gr.HTML('<div class="header"><h1>Solar Inspection</h1></div>')
 
         # ---------- Reactive state ----------
-        run_state          = gr.State("")
-        gcps_state         = gr.State("")
-        click_state        = gr.State({})
-        sim_state          = gr.State({})
-        faults_state       = gr.State({"names": [], "index": {}, "files": []})
-        current_fault_idx  = gr.State(0)
-        pano_overlay_state = gr.State("")
-        pano_png_state     = gr.State("")
-        det_tmp_state      = gr.State("")
+        run_state           = gr.State("")
+        gcps_state          = gr.State("")
+        click_state         = gr.State({})
+        sim_state           = gr.State({})
+        faults_state        = gr.State({"names": [], "index": {}, "files": []})
+        current_fault_idx   = gr.State(0)
+        pano_overlay_state  = gr.State("")
+        pano_png_state      = gr.State("")
+        det_tmp_state       = gr.State("")
         faults_loaded_state = gr.State(False)
 
-        # ---------- Simple nav helpers (toggle page visibility) ----------
+        # ---------- Simple nav helpers ----------
         def show_data():    return (gr.update(visible=True),  gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
         def show_summary(): return (gr.update(visible=False), gr.update(visible=True),  gr.update(visible=False), gr.update(visible=False))
         def show_map():     return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True),  gr.update(visible=False))
         def show_faults():  return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=True))
 
-        # ---------- Declare pages first ----------
+        # ---------- Declare pages ----------
         page_data    = gr.Group(visible=True)
         page_summary = gr.Group(visible=False)
         page_map     = gr.Group(visible=False)
@@ -123,7 +122,7 @@ def build_ui():
 
             btn_copy.click(_load_files_and_gcps, inputs=[uploads], outputs=[run_state, log_copy, gcps_state, gcps_auto_info])
 
-            # Advanced settings hidden by default
+            # Advanced settings (interface unchanged; no Save GCPs button)
             with gr.Accordion("Advanced", open=False):
                 with gr.Row():
                     simulate_ck = gr.Checkbox(value=False, label="Simulation (manual boxes)")
@@ -135,23 +134,6 @@ def build_ui():
                     y_conf  = gr.Slider(0.05, 0.9, value=0.25, step=0.01, label="conf")
                     y_iou   = gr.Slider(0.05, 0.9, value=0.45, step=0.01, label="iou")
                     y_maxd  = gr.Slider(50, 1000, value=300, step=10, label="max_det")
-
-                # Optional: Save GCPs picked from the combined uploads
-                btn_gcps = gr.Button("Save GCPs")
-                gcps_info = gr.Markdown()
-
-                def _attach_gcps_wrapper(run, files):
-                    files = files or []
-                    def _name(x):
-                        try:
-                            return getattr(x, "name", str(x))
-                        except Exception:
-                            return str(x)
-                    json_files = [f for f in files if _name(f).lower().endswith(".json")]
-                    gcps = json_files[0] if json_files else None
-                    return attach_gcps(run, gcps)
-
-                btn_gcps.click(_attach_gcps_wrapper, inputs=[run_state, uploads], outputs=[gcps_state, gcps_info])
 
                 # Simulation subpanel
                 with gr.Accordion("Simulation Annotator", open=False) as sim_panel:
@@ -179,61 +161,57 @@ def build_ui():
                                     inputs=[run_state, frame_dd], outputs=[sim_img])
                     btn_save.click(sim_save, inputs=[run_state, sim_state, sim_label, sim_score], outputs=[sim_save_info, det_json_path])
 
-            # (Run Analysis button removed; detection will run when navigating to Summary if needed)
-
             # Quick nav from Data -> Summary
             with gr.Row(elem_classes=["nav-row"]):
-                btn_nav_summary_from_data = gr.Button("View Summary", elem_classes=["navbtn"]) 
+                btn_nav_summary_from_data = gr.Button("View Summary", elem_classes=["navbtn"])
 
-        # =================== PAGE: MAP (reverted with zoom slider) ===================
+        # =================== PAGE: MAP ===================
         with page_map:
             gr.Markdown("### Map", elem_classes=["section-title"])
             btn_stitch = gr.Button("Stitch & Project")
 
-            # Use a plain Image that expects a *filepath*
-            pano_map   = gr.Image(type="filepath", label="Panorama", interactive=True, height=640,
-                                  sources=[], show_download_button=True, show_fullscreen_button=True)
-            map_info   = gr.Markdown()
-            
+            pano_map = gr.Image(
+                type="filepath", label="Panorama", interactive=True, height=640,
+                sources=[], show_download_button=True, show_fullscreen_button=True
+            )
+            map_info = gr.Markdown()
             with gr.Row():
                 cb_open_maps = gr.Checkbox(value=False, label="Open Google Maps on click")
                 cb_use_gcps  = gr.Checkbox(value=True,  label="Use GCPs")
                 zoom_slider  = gr.Slider(10, 22, value=20, step=1, label="Zoom")
 
-            # IMPORTANT: wire outputs to the Image, not an HTML component
             btn_stitch.click(
                 lambda run: do_stitch_and_project(run, reuse=True),
                 inputs=[run_state],
-                outputs=[pano_map, map_info, pano_overlay_state, pano_png_state],  # Image, Markdown, State, State
+                outputs=[pano_map, map_info, pano_overlay_state, pano_png_state],
             )
 
-            # Clicking on the panorama -> lat/lon + optional browser open
             pano_map.select(
                 map_click,
                 inputs=[run_state, cb_open_maps, zoom_slider, cb_use_gcps],
                 outputs=[map_info],
             )
 
-            # Bottom nav buttons
+            # Bottom nav
             with gr.Row(elem_classes=["nav-row"]):
                 gr.Button("Back to Data", elem_classes=["navbtn"]).click(
                     lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
-            )
-                btn_nav_summary_from_map = gr.Button("View Summary", elem_classes=["navbtn"]) 
+                )
+                btn_nav_summary_from_map = gr.Button("View Summary", elem_classes=["navbtn"])
                 btn_nav_faults_from_map  = gr.Button("View Faults", elem_classes=["navbtn"])
 
         # =================== PAGE: SUMMARY ===================
         with page_summary:
             gr.Markdown("### Summary", elem_classes=["section-title"])
-            btn_refresh = gr.Button("Refresh")
-            summary_md = gr.Markdown()
-            table = gr.Dataframe(headers=["ImageIndex", "Class", "Severity", "Analysis"], row_count=10, wrap=True)
-            btn_pdf   = gr.Button("Download Report (PDF)")
-            pdf_file  = gr.File(label="Report", interactive=False)
+            btn_refresh   = gr.Button("Refresh")
+            summary_md    = gr.Markdown()
+            table         = gr.Dataframe(headers=["ImageIndex", "Class", "Severity", "Analysis"], row_count=10, wrap=True)
+            btn_pdf       = gr.Button("Download Report (PDF)")
+            pdf_file      = gr.File(label="Report", interactive=False)
             det_json_file = gr.File(label="Detections JSON", interactive=False)
 
             def _summary_and_det(run, tmp_path):
-                md, rows = friendly_summary(run)
+                md, rows = friendly_summary(run)  # returns 2 values
                 # Prefer temp file if exists, otherwise run detections.json if present
                 if tmp_path and os.path.isfile(tmp_path):
                     det_path = tmp_path
@@ -246,14 +224,14 @@ def build_ui():
             btn_refresh.click(_summary_and_det, inputs=[run_state, det_tmp_state], outputs=[summary_md, table, det_json_file])
             btn_pdf.click(lambda run: pdf_report(run), inputs=[run_state], outputs=[pdf_file])
 
-            # Bottom nav buttons
+            # Bottom nav
             with gr.Row(elem_classes=["nav-row"]):
                 gr.Button("View Map", elem_classes=["navbtn"]).click(
                     lambda: show_map(), outputs=[page_data, page_summary, page_map, page_faults]
                 )
                 btn_nav_faults_from_summary = gr.Button("View Faults", elem_classes=["navbtn"])
                 gr.Button("Back to Data", elem_classes=["navbtn"]).click(
-                lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
+                    lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
                 )
 
         # =================== PAGE: FAULTS ===================
@@ -261,7 +239,7 @@ def build_ui():
             gr.Markdown("### Faults", elem_classes=["section-title"])
             btn_load_faults = gr.Button("Load")
             with gr.Group(elem_classes=["faults-scroller"]):
-                cards = gr.Gallery(label="Fault Cards", columns=[3])  # fără height aici
+                cards = gr.Gallery(label="Fault Cards", columns=[3])
 
             def _load_faults(run):
                 names, det_index, files = build_fault_index(run)
@@ -273,48 +251,31 @@ def build_ui():
             btn_load_faults.click(_load_faults, inputs=[run_state],
                                   outputs=[cards, faults_state, faults_loaded_state])
 
-            # (Old image navigation removed)
-
-            # Bottom nav buttons
+            # Bottom nav
             with gr.Row(elem_classes=["nav-row"]):
                 gr.Button("Back to Data", elem_classes=["navbtn"]).click(
                     lambda: show_data(), outputs=[page_data, page_summary, page_map, page_faults]
                 )
-                btn_nav_summary_from_faults = gr.Button("View Summary", elem_classes=["navbtn"]) 
+                btn_nav_summary_from_faults = gr.Button("View Summary", elem_classes=["navbtn"])
                 gr.Button("View Map", elem_classes=["navbtn"]).click(
                     lambda: show_map(), outputs=[page_data, page_summary, page_map, page_faults]
-                )    
+                )
 
-        # ---- Nav helpers that also refresh content ----
-        def _summary_and_det(run, tmp_path):
-            md, rows = friendly_summary(run)
-            if tmp_path and os.path.isfile(tmp_path):
-                det_path = tmp_path
-            else:
-                det_path = os.path.join(run or "", "detections.json") if run else ""
-                if not (det_path and os.path.isfile(det_path)):
-                    det_path = None
-            return md, rows, det_path
-
-        def _kickoff_stitch(run):
-            try:
-                threading.Thread(target=lambda: do_stitch_and_project(run, reuse=True), daemon=True).start()
-            except Exception:
-                pass
-
+        # ---- Nav helper that also refreshes Map when stitching finishes ----
         def _nav_summary(run, tmp_path, sim, w, data, classes, imgsz, conf, iou, max_det):
-            v = show_summary()
-            # Ensure detections exist; if not, run detector with provided/Default params
+            """
+            Generator to:
+            1) Navigate to Summary and show current analysis immediately;
+            2) Then run Stitch & Project; when done, push the pano to the Map page automatically.
+            """
+            # Step 1: ensure detections exist (if simulate checked, respect it)
             det_json = os.path.join(run or "", "detections.json") if run else ""
             if not (det_json and os.path.isfile(det_json)):
-                # Default weights fallback
                 w = w or "model.pt"
                 try:
                     _msg, detp_new = run_detector_or_sim(run, bool(sim), w, data, classes, int(imgsz), float(conf), float(iou), int(max_det))
-                    # Invalidate faults cache on new detections
-                    faults_loaded_state.value = False
+                    faults_loaded_state.value = False  # invalidate cache on new dets
                     det_json = detp_new or det_json
-                    # Update a temp copy for download convenience
                     if detp_new and os.path.isfile(detp_new):
                         fd, tpath = tempfile.mkstemp(suffix=".json", prefix="detections_")
                         os.close(fd)
@@ -322,29 +283,42 @@ def build_ui():
                         det_tmp_state.value = tpath
                 except Exception:
                     pass
-            # Start stitching in background so UI remains responsive
-            _kickoff_stitch(run)
+
+            # Prepare initial Summary payload
+            v = show_summary()
             md, rows, detp = _summary_and_det(run, det_tmp_state.value or tmp_path)
-            return (*v, md, rows, detp)
+
+            # Initial yield: update Summary immediately; don't touch Map yet
+            yield (*v, md, rows, detp, gr.update(), gr.update())
+
+            # Step 2: stitch synchronously; when done, push pano to Map
+            try:
+                img_out, msg, ov_abs, pano_abs = do_stitch_and_project(run, reuse=True)
+                pano_overlay_state.value = ov_abs
+                pano_png_state.value     = pano_abs
+                # Second yield: keep Summary the same, but populate Map so it's ready
+                yield (*v, md, rows, detp, img_out, msg)
+            except Exception:
+                # If stitching fails, just leave Map untouched
+                yield (*v, md, rows, detp, gr.update(), gr.update())
 
         def _nav_faults(run, loaded):
             v = show_faults()
             if loaded:
-                # Only toggle visibility; keep existing content
                 return (*v, gr.update(), gr.update(), loaded)
             gallery, st, loaded_out = _load_faults(run)
             return (*v, gallery, st, loaded_out)
 
-        # Wire nav buttons now that targets exist
+        # ---- Wire nav buttons (now also update Map components) ----
         btn_nav_summary_from_data.click(
             _nav_summary,
             inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
-            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file]
+            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file, pano_map, map_info]
         )
         btn_nav_summary_from_map.click(
             _nav_summary,
             inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
-            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file]
+            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file, pano_map, map_info]
         )
         btn_nav_faults_from_map.click(
             _nav_faults,
@@ -359,10 +333,8 @@ def build_ui():
         btn_nav_summary_from_faults.click(
             _nav_summary,
             inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
-            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file]
+            outputs=[page_data, page_summary, page_map, page_faults, summary_md, table, det_json_file, pano_map, map_info]
         )
-
-        # (Preview removed as requested)
 
     return demo
 
