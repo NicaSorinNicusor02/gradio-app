@@ -175,10 +175,21 @@ def build_ui():
                 sources=[], show_download_button=True, show_fullscreen_button=True
             )
             map_info = gr.Markdown()
+
+            # Replaced zoom slider with Save Image
             with gr.Row():
                 cb_open_maps = gr.Checkbox(value=False, label="Open Google Maps on click")
                 cb_use_gcps  = gr.Checkbox(value=True,  label="Use GCPs")
-                zoom_slider  = gr.Slider(10, 22, value=20, step=1, label="Zoom")
+                btn_save_img = gr.Button("Save Image")
+                pano_file_dl = gr.File(label="Panorama (download)", interactive=False)
+
+            # Save Image -> expose the pano path as a downloadable file
+            def _save_pano(pano_path):
+                if pano_path and os.path.isfile(pano_path):
+                    return pano_path
+                return None
+
+            btn_save_img.click(_save_pano, inputs=[pano_png_state], outputs=[pano_file_dl])
 
             btn_stitch.click(
                 lambda run: do_stitch_and_project(run, reuse=True),
@@ -186,9 +197,10 @@ def build_ui():
                 outputs=[pano_map, map_info, pano_overlay_state, pano_png_state],
             )
 
+            # Clicking on the panorama -> lat/lon + optional browser open (fixed zoom=20)
             pano_map.select(
-                map_click,
-                inputs=[run_state, cb_open_maps, zoom_slider, cb_use_gcps],
+                lambda run, open_maps, use_gcps: map_click(run, open_maps, 20, use_gcps),
+                inputs=[run_state, cb_open_maps, cb_use_gcps],
                 outputs=[map_info],
             )
 
@@ -264,9 +276,9 @@ def build_ui():
         # ---- Nav helper that also refreshes Map when stitching finishes ----
         def _nav_summary(run, tmp_path, sim, w, data, classes, imgsz, conf, iou, max_det):
             """
-            Generator to:
-            1) Navigate to Summary and show current analysis immediately;
-            2) Then run Stitch & Project; when done, push the pano to the Map page automatically.
+            1) Navigate to Summary immediately;
+            2) Ensure detections exist;
+            3) Stitch; when done, push pano to the Map page (no extra clicks).
             """
             # Step 1: ensure detections exist (if simulate checked, respect it)
             det_json = os.path.join(run or "", "detections.json") if run else ""
@@ -284,14 +296,14 @@ def build_ui():
                 except Exception:
                     pass
 
-            # Prepare initial Summary payload
+            # Step 2: prepare initial Summary payload using the same helper as Refresh
             v = show_summary()
             md, rows, detp = _summary_and_det(run, det_tmp_state.value or tmp_path)
 
             # Initial yield: update Summary immediately; don't touch Map yet
             yield (*v, md, rows, detp, gr.update(), gr.update())
 
-            # Step 2: stitch synchronously; when done, push pano to Map
+            # Step 3: stitch synchronously; when done, push pano to Map
             try:
                 img_out, msg, ov_abs, pano_abs = do_stitch_and_project(run, reuse=True)
                 pano_overlay_state.value = ov_abs
@@ -299,7 +311,6 @@ def build_ui():
                 # Second yield: keep Summary the same, but populate Map so it's ready
                 yield (*v, md, rows, detp, img_out, msg)
             except Exception:
-                # If stitching fails, just leave Map untouched
                 yield (*v, md, rows, detp, gr.update(), gr.update())
 
         def _nav_faults(run, loaded):
@@ -309,7 +320,7 @@ def build_ui():
             gallery, st, loaded_out = _load_faults(run)
             return (*v, gallery, st, loaded_out)
 
-        # ---- Wire nav buttons (now also update Map components) ----
+        # ---- Wire nav buttons (also update Map components) ----
         btn_nav_summary_from_data.click(
             _nav_summary,
             inputs=[run_state, det_tmp_state, simulate_ck, y_weights, y_data, y_classes, y_imgsz, y_conf, y_iou, y_maxd],
