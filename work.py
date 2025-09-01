@@ -7,16 +7,18 @@ import numpy as np
 import cv2 as cv
 from PIL import Image, ImageDraw
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-CORE = os.path.join(HERE, "core")
-if CORE not in sys.path:
-    sys.path.insert(0, CORE)
-
 from core.stitcher import Stitcher
 from core.mapper import GeoMapper
 from core.detector import YOLODetector
 from core.box_projector import PanoBoxProjector
 from core.geolocalizer import PanoGeoLocalizer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CORE = os.path.join(HERE, "core")
+if CORE not in sys.path:
+    sys.path.insert(0, CORE)
+
+
 
 RUNS_DIR = os.path.join(HERE, "app_runs")
 if os.path.exists(RUNS_DIR):
